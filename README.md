@@ -5,6 +5,9 @@ Find the right Drupal contributed module by describing the problem you need to
 solve, inspect a module's details, and get the composer command to install it.
 All output is raw Markdown.
 
+## Installation
+
+
 ## Layout
 
 ```
@@ -53,11 +56,3 @@ copy of the command alongside it into a skills directory:
 ./drupal-module-finder install-skill --agent=claude   # -> .claude/skills/drupal-module-finder
 ./drupal-module-finder install-skill                  # -> .agents/skills/drupal-module-finder
 ```
-
-## Tests
-
-```bash
-bash skills/drupal-module-finder/test-completion.sh
-```
-
-No network or Drupal needed — the completion tests run against a temporary cache.
