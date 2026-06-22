@@ -1,0 +1,718 @@
+#!/usr/bin/env bash
+#
+# drupal-module-finder - command-line client for the Module Finder API.
+#
+# Fetches Markdown from the module_api endpoints and caches successful
+# responses locally for 14 days under ~/.cache/drupal-module-finder/.
+
+set -euo pipefail
+
+DEFAULT_HOST="http://module-finder.ddev.site"
+CACHE_DIR="${DRUPAL_MODULE_FINDER_CACHE:-${HOME}/.cache/drupal-module-finder}"
+CACHE_TTL_DAYS=14
+
+# Absolute path to this script, so install-skill can bundle a copy of itself.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# Canonical list of subcommands (single source of truth for shell completion).
+SUBCOMMANDS=(module-info semantic-search release-info file-structure documentation-info readme install-skill completion)
+
+usage() {
+  cat <<'EOF'
+drupal-module-finder - query the Module Finder API (output is raw Markdown)
+
+Usage:
+  drupal-module-finder module-info <data_name> [--all] [--fields=f1,f2,...]
+  drupal-module-finder semantic-search "<search words>" [--chunk=true]
+  drupal-module-finder release-info <data_name>
+  drupal-module-finder file-structure <data_name>
+  drupal-module-finder documentation-info <data_name>
+  drupal-module-finder readme <data_name>
+  drupal-module-finder install-skill [--agent=claude]
+  drupal-module-finder completion [bash]
+  drupal-module-finder --help | -h
+
+Commands:
+  module-info <data_name>      Module summary as Markdown.
+      --all                    Verbose mode: every field, with releases expanded.
+      --fields=stars,...       Only the listed fields (drop the "field_" prefix,
+                               e.g. stars, module_categories). "title" is allowed.
+  semantic-search "<words>"    Up to 10 modules ranked by semantic relevance
+                               (scores below 0.3 are dropped). Never cached.
+      --chunk=true             Also show each result's highest-rated matching
+                               chunk (hidden by default; --chunk also works).
+  release-info <data_name>     Releases and their composer commands.
+  file-structure <data_name>   The module's file structure.
+  documentation-info <data_name>
+                               The module's external documentation link, or
+                               "No documentation found" when none is set.
+  readme <data_name>           The module's README text, or "No readme found"
+                               when empty.
+  install-skill                Install the agent skill (SKILL.md + a bundled copy
+                               of this command) into the current directory.
+      --agent=claude           Install to .claude/skills/drupal-module-finder.
+                               Any other/no agent uses .agents/skills/drupal-module-finder.
+  completion [bash]            Print the bash completion script. Enable with:
+                               source <(drupal-module-finder completion bash)
+                               (registers for the name "drupal-module-finder" on
+                               your PATH; the "./" form does not auto-complete).
+
+Options (any command):
+  --host=<url>                 API base URL (default: http://module-finder.ddev.site).
+
+Caching:
+  module-info, file-structure, documentation-info and readme read the module's
+  JSON document from /sites/default/files/modules/<data_name>.json, cached for
+  14 days at ~/.cache/drupal-module-finder/<data_name>.json. release-info is
+  cached similarly. semantic-search is never cached (results track the index).
+EOF
+}
+
+die() {
+  printf 'Error: %s\n\n' "$1" >&2
+  usage >&2
+  exit 1
+}
+
+# Is the cache file present and younger than the TTL?
+is_fresh() {
+  local f="$1"
+  [ -f "$f" ] && [ -n "$(find "$f" -mtime "-${CACHE_TTL_DAYS}" 2>/dev/null)" ]
+}
+
+# serve <path> <cache_key> <host> [urlencode_data]
+# Prints the (possibly cached) response body. Errors go to stderr, no caching.
+# When urlencode_data (e.g. "semantic_search=foo bar") is given it is sent with
+# curl -G --data-urlencode so spaces and specials are encoded safely.
+serve() {
+  local path="$1" key="$2" host="$3" enc="${4:-}"
+  # An empty key disables local caching (e.g. for live search results).
+  local cache_file=""
+  [ -n "$key" ] && cache_file="${CACHE_DIR}/${key}"
+
+  if [ -n "$cache_file" ] && is_fresh "$cache_file"; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  local resp code body
+  if [ -n "$enc" ]; then
+    resp=$(curl -sk -G -w $'\n%{http_code}' --data-urlencode "$enc" "${host}${path}") || {
+      printf 'Error: request to %s%s failed\n' "$host" "$path" >&2
+      return 1
+    }
+  elif ! resp=$(curl -sk -w $'\n%{http_code}' "${host}${path}"); then
+    printf 'Error: request to %s%s failed\n' "$host" "$path" >&2
+    return 1
+  fi
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+
+  if [ "$code" -ge 400 ]; then
+    printf '%s\n' "$body" >&2
+    return 1
+  fi
+
+  if [ -n "$cache_file" ]; then
+    mkdir -p "$CACHE_DIR"
+    printf '%s\n' "$body" >"$cache_file"
+  fi
+  printf '%s\n' "$body"
+}
+
+# --- JSON-backed module data ---------------------------------------------
+#
+# All commands except semantic-search and release-info read the module's full
+# JSON document from {host}/sites/default/files/modules/{data_name}.json and
+# extract fields from it. Release data is not in that document, so release-info
+# (and the "Name of releases" line) still come from the API.
+
+# Field machine name => human label (used by --all and --fields).
+declare -A LABELS=(
+  [title]="Module Name"
+  [field_data_name]="Data Name"
+  [field_development_status]="Development Status"
+  [field_documentation]="Documentation"
+  [field_drupal_version_coverage]="Drupal Version Coverage"
+  [field_external_information]="External Information"
+  [field_file_structure]="File Structure"
+  [field_full_vector_search]="Full Vector Search"
+  [field_has_agentic_skills]="Has Agentic Skills"
+  [field_latest_module_releases]="Latest Module Releases"
+  [field_latest_release_date]="Latest Release Date"
+  [field_latest_update]="Latest Update"
+  [field_link_to_module]="Link to Module"
+  [field_module_affordances]="Module Affordances"
+  [field_module_categories]="Module Categories"
+  [field_module_description]="Module Description"
+  [field_module_development_status]="Module Development Status"
+  [field_module_maintainers]="Module Maintainers"
+  [field_module_readme_text]="Module Readme Text"
+  [field_module_summary]="Module Summary"
+  [field_project_usage]="Project Usage"
+  [field_security_covered]="Security Covered"
+  [field_stars]="Stars"
+  [field_supporting_organizations]="Supporting Organizations"
+)
+
+# Default module-info output: ordered "Label::field" pairs.
+DEFAULT_FIELDS=(
+  "Module Name::title"
+  "Module Description::field_module_description"
+  "Security Coverage::field_security_covered"
+  "Project Usage::field_project_usage"
+  "Data Name::field_data_name"
+  "Link to Module::field_link_to_module"
+  "Module Development Status::field_module_development_status"
+  "Development Status::field_development_status"
+  "Module Categories::field_module_categories"
+  "Last Update Date::field_latest_update"
+  "Drupal version coverage::field_drupal_version_coverage"
+  "external information::field_external_information"
+  "stars::field_stars"
+  "Latest Release Date::field_latest_release_date"
+  "Has Agentic Skills::field_has_agentic_skills"
+  "Name of releases::field_latest_module_releases"
+)
+
+DATE_FIELDS="field_latest_update field_latest_release_date"
+LIST_FIELDS="field_security_covered field_drupal_version_coverage field_module_categories field_has_agentic_skills field_module_development_status field_development_status"
+BLOCK_FIELDS="field_module_description field_module_readme_text field_documentation field_file_structure field_full_vector_search"
+
+in_set() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# Title-case a machine value: drupal_10 -> "Drupal 10".
+humanize() {
+  printf '%s' "$1" | sed 's/_/ /g' | awk '{for (i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1'
+}
+
+# Download (and 14-day cache) a module's JSON document; prints it to stdout.
+fetch_json() {
+  local data_name="$1" host="$2"
+  local cache_file="${CACHE_DIR}/${data_name}.json"
+  if is_fresh "$cache_file"; then
+    cat "$cache_file"
+    return 0
+  fi
+  local resp code body
+  if ! resp=$(curl -sk -w $'\n%{http_code}' "${host}/sites/default/files/modules/${data_name}.json"); then
+    printf 'Error: request to %s failed\n' "$host" >&2
+    return 1
+  fi
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [ "$code" -ge 400 ]; then
+    printf '# Error\n\nNo module found with data name `%s`.\n' "$data_name" >&2
+    return 1
+  fi
+  mkdir -p "$CACHE_DIR"
+  printf '%s' "$body" >"$cache_file"
+  printf '%s' "$body"
+}
+
+# Extract a field: scalar on one line, array items one per line, nothing if null.
+jget() {
+  jq -r --arg k "$1" '.[$k] | if . == null then empty elif type == "array" then .[] else . end' <<<"$2"
+}
+
+# Format a field value as Markdown (lists humanized, dates as Y-m-d).
+format_value() {
+  local key="$1" json="$2"
+
+  if in_set "$key" "$DATE_FIELDS"; then
+    local ts
+    ts=$(jq -r --arg k "$key" '.[$k] // empty' <<<"$json")
+    [ -z "$ts" ] && { printf '—'; return; }
+    date -d "@$ts" +'%Y-%m-%d' 2>/dev/null || printf '%s' "$ts"
+    return
+  fi
+
+  if in_set "$key" "$LIST_FIELDS"; then
+    local -a vals out=()
+    mapfile -t vals < <(jget "$key" "$json")
+    [ "${#vals[@]}" -eq 0 ] && { printf '—'; return; }
+    local v
+    for v in "${vals[@]}"; do out+=("$(humanize "$v")"); done
+    local joined
+    printf -v joined '%s, ' "${out[@]}"
+    printf '%s' "${joined%, }"
+    return
+  fi
+
+  # Scalar (newlines preserved) or, for unexpected arrays, joined with ", ".
+  local val
+  val=$(jq -r --arg k "$key" '.[$k] | if . == null then empty elif type == "array" then join(", ") else . end' <<<"$json")
+  [ -z "$val" ] && { printf '—'; return; }
+  printf '%s' "$val"
+}
+
+# Release titles ("- <title>" per line) from the API; empty if none.
+release_titles() {
+  local md
+  md=$(serve "/api/module/${1}/releases" "${1}--releases" "$2" 2>/dev/null) || return 0
+  printf '%s\n' "$md" | sed -n 's/^- \*\*\(.*\)\*\*$/- \1/p'
+}
+
+# Render one "Label / value" entry as Markdown (no trailing newline).
+render_entry() {
+  local label="$1" key="$2" json="$3" data_name="$4" host="$5"
+  if [ "$key" = "field_latest_module_releases" ]; then
+    local titles
+    titles=$(release_titles "$data_name" "$host")
+    if [ -n "$titles" ]; then
+      printf '**%s:**\n\n%s' "$label" "$titles"
+    else
+      printf '**%s:** —' "$label"
+    fi
+    return
+  fi
+  local value
+  value=$(format_value "$key" "$json")
+  if in_set "$key" "$BLOCK_FIELDS" && [ "$value" != "—" ]; then
+    printf '**%s:**\n\n%s' "$label" "$value"
+  else
+    printf '**%s:** %s' "$label" "$value"
+  fi
+}
+
+# Emit the SKILL.md document (embedded so the command is self-contained).
+skill_md() {
+  cat <<'SKILL_EOF'
+---
+name: drupal-module-finder
+description: Find, evaluate, and install Drupal contributed modules by describing the problem to solve. Use whenever the user needs a Drupal module for a task, wants module recommendations or comparisons, or needs the composer command to install one.
+---
+
+# Drupal Module Finder
+
+Use the `drupal-module-finder` CLI to find the right Drupal contributed module for a
+need, learn about it, and get the composer command to install it.
+
+A copy of the command is bundled in this skill directory. Run it as
+`./drupal-module-finder` from here, or just `drupal-module-finder` if it is on your
+PATH. All output is raw Markdown. Target a different site with `--host=<url>`
+(default: http://module-finder.ddev.site).
+
+## Always check what is already available first
+
+Before searching for or recommending a new module to download, prefer what the
+project already has:
+
+1. **Drupal core modules** — if core already provides the capability, recommend
+   enabling the core module rather than installing a contributed one.
+2. **Already-downloaded modules** — modules already present in the codebase (e.g.
+   under `web/modules/contrib` and `web/modules/custom`, or listed in the
+   project's `composer.json`) but not yet enabled. Recommend enabling one of
+   those before adding a new dependency.
+
+Only fall through to the search workflow below when neither Drupal core nor an
+already-downloaded module covers the need.
+
+## Workflow
+
+### 1. Search by describing the problem
+Describe WHAT needs to be solved. Do **not** put the word "module" in the query —
+that is implied.
+
+    drupal-module-finder semantic-search "send private messages between users"
+
+**One focused need per search.** Each search must target a single capability —
+never a whole product or a broad goal. If the user asks for something large like
+"I want to build Facebook", split it into individual needs and run a separate
+search for each, one at a time:
+
+    drupal-module-finder semantic-search "send private messages between users"
+    drupal-module-finder semantic-search "poke or react to other people's profiles"
+    drupal-module-finder semantic-search "news feed of friends' activity"
+
+Run them sequentially (one request at a time) and evaluate each result set on its
+own. A broad, multi-feature query returns poor matches; a single, specific need
+returns good ones.
+
+- Returns up to 10 candidate modules ranked by semantic relevance.
+- Each candidate shows: title and **data name** (in parentheses), a summary, the
+  relevance score, and meta data (data name, project URL, development status,
+  security coverage, stars, project usage, latest release, agentic skills, and
+  Drupal version coverage).
+- Add `--chunk=true` to also show the best-matching text excerpt per candidate.
+- If nothing fits, rephrase the problem and search again.
+
+### 2. Investigate the candidates
+For any promising candidate, use its **data name** (the value in parentheses, e.g.
+`Privatemsg (privatemsg)` -> `privatemsg`) to get the full details:
+
+    drupal-module-finder module-info privatemsg
+
+Add `--all` for every field, or `--fields=stars,project_usage` to focus on a few.
+
+### 3. Get the install / composer command
+Once a module looks right, get its releases and composer commands:
+
+    drupal-module-finder release-info privatemsg
+
+Then give the composer command to the user (e.g. `composer require 'drupal/privatemsg:^4.0'`).
+
+## All commands
+
+| Command | What it gives you |
+| --- | --- |
+| `semantic-search "<problem>" [--chunk=true]` | Ranked candidate modules for a described need. Start here. Never cached. |
+| `module-info <data_name> [--all] [--fields=...]` | A module's summary + meta data. `--all` = every field; `--fields=` = only the listed fields (drop the `field_` prefix, e.g. `stars`, `module_categories`; `title` is allowed). |
+| `release-info <data_name>` | Releases with their composer commands. Use this to install. |
+| `documentation-info <data_name>` | Link to the module's external documentation (or "No documentation found"). |
+| `readme <data_name>` | The module's README (or "No readme found"). |
+| `file-structure <data_name>` | The module's file/folder structure. |
+
+## Fields
+
+`module-info <data_name> --fields=...` accepts these names (comma-separated, no
+`field_` prefix). The same names are the labels you will see in the output.
+
+| Field | Label | Notes |
+| --- | --- | --- |
+| `title` | Module Name | The node title. |
+| `data_name` | Data Name | Drupal.org machine name (used in every command). |
+| `module_summary` | Module Summary | Short human summary. |
+| `module_description` | Module Description | Longer description. |
+| `module_readme_text` | Module Readme Text | Full README (see also `readme`). |
+| `documentation` | Documentation | Documentation text. |
+| `external_information` | External Information | External docs link (see also `documentation-info`). |
+| `link_to_module` | Link to Module | Project URL. |
+| `module_categories` | Module Categories | e.g. Access Control, AI, Automation. |
+| `module_development_status` | Module Development Status | e.g. Actively Maintained, Unsupported. |
+| `development_status` | Development Status | e.g. Under Active Development, Obsolete. |
+| `security_covered` | Security Covered | Covered / Not Covered. |
+| `drupal_version_coverage` | Drupal Version Coverage | e.g. Drupal 10, Drupal 11. |
+| `has_agentic_skills` | Has Agentic Skills | Whether the module ships agentic skills. |
+| `stars` | Stars | Star count. |
+| `project_usage` | Project Usage | Number of sites reporting use. |
+| `latest_release_date` | Latest Release Date | Date of the latest release. |
+| `latest_update` | Latest Update | Last update date. |
+| `latest_module_releases` | Latest Module Releases | Release titles (full detail via `release-info`). |
+| `module_maintainers` | Module Maintainers | Maintainer names. |
+| `supporting_organizations` | Supporting Organizations | Backing organizations. |
+| `module_affordances` | Module Affordances | What the module lets you do. |
+| `file_structure` | File Structure | File/folder layout (see also `file-structure`). |
+| `full_vector_search` | Full Vector Search | Aggregated text used for semantic search (large). |
+
+Example:
+
+    drupal-module-finder module-info privatemsg --fields=stars,project_usage,security_covered,drupal_version_coverage
+
+Use `--all` to dump every field at once (releases expanded).
+
+### How they help an evaluation
+- **semantic-search** narrows the field fast from a plain-language description.
+- **module-info** confirms fit: maintenance and security status, Drupal version
+  coverage, plus usage and stars as trust signals.
+- **release-info** gives the exact composer command and version constraints.
+- **readme** and **documentation-info** explain setup and configuration.
+- **file-structure** reveals submodules and what ships in the package.
+
+## Options
+- `--host=<url>` — point at a different Module Finder site.
+- `--chunk=true` — (semantic-search) include the best-matching excerpt.
+- `--all`, `--fields=` — (module-info) control which fields are shown.
+
+## Shell completion (bash)
+
+Enable TAB completion for subcommands, options, `--fields=` values, `--agent=`
+values, and any module data names you have already cached:
+
+    source <(drupal-module-finder completion bash)
+
+Add that line to your `~/.bashrc` to make it permanent. Completion is registered
+for the `drupal-module-finder` name on your PATH; running it as
+`./drupal-module-finder` will not auto-complete.
+
+## Tips
+- Always search with a problem description — never a module name, and never the
+  word "module".
+- Carry the **data name** from the search results into every follow-up command.
+- Prefer modules that are actively maintained, security-covered, and cover the
+  user's Drupal version.
+SKILL_EOF
+}
+
+# --- Shell completion ----------------------------------------------------
+#
+# The `completion` subcommand both prints the bash completion script and serves
+# the dynamic lists that script queries at TAB time, so there is a single source
+# of truth for subcommands, field names and cached data names.
+
+# Space-separated list of subcommands.
+completion_commands() {
+  printf '%s\n' "${SUBCOMMANDS[*]}"
+}
+
+# Field names accepted by `module-info --fields=` (LABELS keys without the
+# field_ prefix, plus the special "title").
+completion_fields() {
+  local k out=()
+  for k in "${!LABELS[@]}"; do
+    if [ "$k" = "title" ]; then out+=("title"); else out+=("${k#field_}"); fi
+  done
+  printf '%s\n' "${out[*]}"
+}
+
+# Data names that currently have a cached JSON document. The release cache key
+# is "<name>--releases" (no .json), so globbing *.json yields data names only.
+completion_data_names() {
+  local f names=()
+  [ -d "$CACHE_DIR" ] || return 0
+  for f in "$CACHE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    f="$(basename "$f")"
+    names+=("${f%.json}")
+  done
+  [ "${#names[@]}" -eq 0 ] || printf '%s\n' "${names[*]}"
+}
+
+# The bash completion script (emitted verbatim; it calls back into the command
+# for the dynamic lists above).
+completion_script() {
+  cat <<'COMPLETION_EOF'
+# bash completion for drupal-module-finder
+# Enable with:  source <(drupal-module-finder completion bash)
+_drupal_module_finder() {
+  local cur cmd subcommand
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  cmd="${COMP_WORDS[0]}"
+  subcommand="${COMP_WORDS[1]}"
+
+  # Completing the subcommand itself.
+  if [ "$COMP_CWORD" -le 1 ]; then
+    COMPREPLY=( $(compgen -W "$("$cmd" completion commands 2>/dev/null)" -- "$cur") )
+    return 0
+  fi
+
+  # Value completion for "=" options.
+  case "$cur" in
+    --fields=*)
+      local val base last fields
+      val="${cur#--fields=}"
+      fields="$("$cmd" completion fields 2>/dev/null)"
+      if [[ "$val" == *,* ]]; then
+        base="${val%,*},"
+        last="${val##*,}"
+      else
+        base=""
+        last="$val"
+      fi
+      COMPREPLY=( $(compgen -P "--fields=${base}" -W "$fields" -- "$last") )
+      compopt -o nospace 2>/dev/null
+      return 0
+      ;;
+    --agent=*)
+      COMPREPLY=( $(compgen -P "--agent=" -W "claude" -- "${cur#--agent=}") )
+      return 0
+      ;;
+    --host=*)
+      return 0
+      ;;
+  esac
+
+  # Per-subcommand option set.
+  local opts
+  case "$subcommand" in
+    module-info)     opts="--all --fields= --host= --help" ;;
+    semantic-search) opts="--chunk= --host= --help" ;;
+    install-skill)   opts="--agent= --host= --help" ;;
+    release-info|file-structure|documentation-info|readme)
+                     opts="--host= --help" ;;
+    *)               opts="--host= --help" ;;
+  esac
+
+  # Positional <data_name> completion for the data-name commands (unless the
+  # user is clearly typing an option). semantic-search takes free text, so it is
+  # intentionally excluded.
+  case " module-info release-info file-structure documentation-info readme " in
+    *" $subcommand "*)
+      if [[ "$cur" != -* ]]; then
+        COMPREPLY=( $(compgen -W "$("$cmd" completion data-names 2>/dev/null)" -- "$cur") )
+        return 0
+      fi
+      ;;
+  esac
+
+  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+  # Keep the cursor next to a sole option that still needs a value.
+  if [ "${#COMPREPLY[@]}" -eq 1 ] && [[ "${COMPREPLY[0]}" == *= ]]; then
+    compopt -o nospace 2>/dev/null
+  fi
+  return 0
+}
+complete -F _drupal_module_finder drupal-module-finder
+COMPLETION_EOF
+}
+
+main() {
+  [ $# -eq 0 ] && { usage; exit 0; }
+
+  local command="" data_name="" host="$DEFAULT_HOST"
+  local all=0 fields="" chunk=0 agent=""
+
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+
+  command="$1"
+  shift
+
+  # completion takes its own (non-flag) sub-arguments, so handle it before the
+  # generic flag parser below.
+  if [ "$command" = "completion" ]; then
+    case "${1:-bash}" in
+      bash | "") completion_script ;;
+      commands) completion_commands ;;
+      fields) completion_fields ;;
+      data-names) completion_data_names ;;
+      *) die "completion: unknown argument: $1" ;;
+    esac
+    exit 0
+  fi
+
+  # Parse remaining args: one positional data_name plus flags.
+  for arg in "$@"; do
+    case "$arg" in
+      --all) all=1 ;;
+      --chunk) chunk=1 ;;
+      --chunk=*) [ "${arg#--chunk=}" = "true" ] && chunk=1 ;;
+      --fields=*) fields="${arg#--fields=}" ;;
+      --host=*) host="${arg#--host=}" ;;
+      --agent=*) agent="${arg#--agent=}" ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -*) die "unknown option: $arg" ;;
+      *)
+        [ -z "$data_name" ] || die "unexpected argument: $arg"
+        data_name="$arg"
+        ;;
+    esac
+  done
+
+  host="${host%/}"
+
+  case "$command" in
+    module-info)
+      [ -n "$data_name" ] || die "module-info requires a <data_name>"
+      local json
+      json=$(fetch_json "$data_name" "$host") || exit 1
+
+      local -a entries=()
+      local pair label key
+      if [ "$all" -eq 1 ]; then
+        # Every field present in the document (title first).
+        local -a keys
+        mapfile -t keys < <(jq -r 'keys_unsorted[]' <<<"$json")
+        entries+=("$(render_entry "Module Name" "title" "$json" "$data_name" "$host")")
+        for key in "${keys[@]}"; do
+          [[ "$key" == field_* ]] || continue
+          label="${LABELS[$key]:-$(humanize "${key#field_}")}"
+          entries+=("$(render_entry "$label" "$key" "$json" "$data_name" "$host")")
+        done
+      elif [ -n "$fields" ]; then
+        local -a filters=() invalid=() valid=()
+        IFS=',' read -ra filters <<<"$fields" || true
+        local f
+        for f in "${filters[@]}"; do
+          f="$(printf '%s' "$f" | tr -d '[:space:]')"
+          [ -z "$f" ] && continue
+          if [ "$f" = "title" ]; then
+            valid+=("title")
+          elif [ -n "${LABELS[field_$f]:-}" ]; then
+            valid+=("field_$f")
+          else
+            invalid+=("$f")
+          fi
+        done
+        if [ "${#invalid[@]}" -gt 0 ]; then
+          local joined
+          printf -v joined '%s`, `' "${invalid[@]}"
+          printf '# Error\n\nUnknown field(s): `%s`.\n' "${joined%\`, \`}" >&2
+          exit 1
+        fi
+        for key in "${valid[@]}"; do
+          entries+=("$(render_entry "${LABELS[$key]}" "$key" "$json" "$data_name" "$host")")
+        done
+      else
+        for pair in "${DEFAULT_FIELDS[@]}"; do
+          label="${pair%%::*}"
+          key="${pair##*::}"
+          entries+=("$(render_entry "$label" "$key" "$json" "$data_name" "$host")")
+        done
+      fi
+
+      # Join entries with blank lines.
+      local first=1 e
+      for e in "${entries[@]+"${entries[@]}"}"; do
+        [ "$first" -eq 1 ] && first=0 || printf '\n\n'
+        printf '%s' "$e"
+      done
+      printf '\n'
+      ;;
+
+    semantic-search)
+      [ -n "$data_name" ] || die "semantic-search requires a quoted <search string>"
+      local search_path="/api/module-search"
+      [ "$chunk" -eq 1 ] && search_path="${search_path}?chunk=true"
+      # Empty cache key: search results are never cached (they track the index).
+      serve "$search_path" "" "$host" "semantic_search=${data_name}"
+      ;;
+
+    release-info)
+      [ -n "$data_name" ] || die "release-info requires a <data_name>"
+      serve "/api/module/${data_name}/releases" "${data_name}--releases" "$host"
+      ;;
+
+    file-structure)
+      [ -n "$data_name" ] || die "file-structure requires a <data_name>"
+      local json fs
+      json=$(fetch_json "$data_name" "$host") || exit 1
+      fs=$(jget field_file_structure "$json")
+      if [ -z "$fs" ]; then echo "No file structure found"; else printf '%s\n' "$fs"; fi
+      ;;
+
+    documentation-info)
+      [ -n "$data_name" ] || die "documentation-info requires a <data_name>"
+      local json doc
+      json=$(fetch_json "$data_name" "$host") || exit 1
+      doc=$(jget field_external_information "$json")
+      if [ -z "$doc" ]; then echo "No documentation found"; else printf '%s\n' "$doc"; fi
+      ;;
+
+    readme)
+      [ -n "$data_name" ] || die "readme requires a <data_name>"
+      local json readme
+      json=$(fetch_json "$data_name" "$host") || exit 1
+      readme=$(jget field_module_readme_text "$json")
+      if [ -z "$readme" ]; then echo "No readme found"; else printf '%s\n' "$readme"; fi
+      ;;
+
+    install-skill)
+      local base
+      if [ "$agent" = "claude" ]; then
+        base=".claude/skills/drupal-module-finder"
+      else
+        base=".agents/skills/drupal-module-finder"
+      fi
+      mkdir -p "$base"
+      # Bundle a copy of this command so the skill is self-contained.
+      cp "$SELF" "$base/drupal-module-finder"
+      chmod +x "$base/drupal-module-finder"
+      skill_md >"$base/SKILL.md"
+      printf 'Installed drupal-module-finder skill to %s\n' "$base"
+      ;;
+
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
