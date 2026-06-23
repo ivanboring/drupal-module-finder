@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-DEFAULT_HOST="http://module-finder.ddev.site"
+DEFAULT_HOST="https://module-finder.marcusmailbox.com"
 CACHE_DIR="${DRUPAL_MODULE_FINDER_CACHE:-${HOME}/.cache/drupal-module-finder}"
 CACHE_TTL_DAYS=14
 
@@ -58,7 +58,7 @@ Commands:
                                your PATH; the "./" form does not auto-complete).
 
 Options (any command):
-  --host=<url>                 API base URL (default: http://module-finder.ddev.site).
+  --host=<url>                 API base URL (default: https://module-finder.marcusmailbox.com/).
 
 Caching:
   module-info, file-structure, documentation-info and readme read the module's
