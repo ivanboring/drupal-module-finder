@@ -14,6 +14,93 @@ CACHE_TTL_DAYS=14
 # Absolute path to this script, so install-skill can bundle a copy of itself.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
+# --- Usage statistics ----------------------------------------------------
+#
+# Real commands record lightweight usage stats into the skill's data/
+# directory (next to this command), in stats.json:
+#
+#   requests.search / requests.json / requests.release
+#       number of *HTTP requests actually made* to the API for each kind of
+#       data (search, module JSON and release data); answers served from the
+#       local cache are not requests, so they are not counted;
+#   searches
+#       the text of every semantic-search query that was run;
+#   output_characters.total / .search / .info / .release
+#       running total of characters written to stdout across all runs, plus a
+#       per-kind breakdown: search (semantic-search), info (module-info,
+#       file-structure, documentation-info, readme) and release (release-info).
+#
+# Stats are best-effort: a failure to record never aborts or slows the command
+# being measured.
+
+DATA_DIR="$(dirname "$SELF")/data"
+STATS_FILE="${DATA_DIR}/stats.json"
+
+# Create the stats file with zeroed counters if it does not exist yet.
+ensure_stats() {
+  mkdir -p "$DATA_DIR" 2>/dev/null || return 1
+  [ -f "$STATS_FILE" ] && return 0
+  printf '%s\n' '{"requests":{"search":0,"json":0,"release":0},"searches":[],"output_characters":{"total":0,"search":0,"info":0,"release":0}}' \
+    >"$STATS_FILE" 2>/dev/null || return 1
+}
+
+# Apply a jq program (filter + optional args) to the stats file in place.
+# Best-effort: any failure leaves the file untouched and never fails the caller.
+stats_apply() {
+  ensure_stats || return 0
+  local tmp
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  if jq "$@" "$STATS_FILE" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATS_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# Count one HTTP request of the given category: search | json | release.
+record_request() {
+  stats_apply --arg c "$1" '.requests[$c] = (.requests[$c] // 0) + 1'
+}
+
+# Append a search query to the recorded list of all searches.
+record_search() {
+  stats_apply --arg q "$1" '.searches += [$q]'
+}
+
+# Add n output characters to the running total and, when a category is given
+# (search|info|release), to that category's subtotal as well.
+record_output() {
+  local n="$1" c="${2:-}"
+  if [ -n "$c" ]; then
+    stats_apply --argjson n "$n" --arg c "$c" \
+      '.output_characters.total = (.output_characters.total // 0) + $n
+       | .output_characters[$c]  = (.output_characters[$c]  // 0) + $n'
+  else
+    stats_apply --argjson n "$n" \
+      '.output_characters.total = (.output_characters.total // 0) + $n'
+  fi
+}
+
+# EXIT handler installed for real commands: flush the captured stdout to the
+# real terminal and record how many characters it contained (attributed to
+# __out_category, one of search|info|release, or the total only when empty).
+__stats_out=""
+__out_category=""
+flush_output() {
+  local rc=$?
+  exec 1>&3 2>/dev/null || true
+  exec 3>&- 2>/dev/null || true
+  if [ -n "${__stats_out:-}" ] && [ -f "$__stats_out" ]; then
+    cat "$__stats_out" 2>/dev/null || true
+    local n
+    n="$(wc -m <"$__stats_out" 2>/dev/null | tr -d '[:space:]')" || n=""
+    [ -n "$n" ] && record_output "$n" "$__out_category"
+    rm -f "$__stats_out" 2>/dev/null || true
+  fi
+  return $rc
+}
+
 # Canonical list of subcommands (single source of truth for shell completion).
 SUBCOMMANDS=(module-info semantic-search release-info file-structure documentation-info readme install-skill completion)
 
@@ -85,7 +172,7 @@ is_fresh() {
 # When urlencode_data (e.g. "semantic_search=foo bar") is given it is sent with
 # curl -G --data-urlencode so spaces and specials are encoded safely.
 serve() {
-  local path="$1" key="$2" host="$3" enc="${4:-}"
+  local path="$1" key="$2" host="$3" enc="${4:-}" category="${5:-}"
   # An empty key disables local caching (e.g. for live search results).
   local cache_file=""
   [ -n "$key" ] && cache_file="${CACHE_DIR}/${key}"
@@ -94,6 +181,9 @@ serve() {
     cat "$cache_file"
     return 0
   fi
+
+  # Cache miss: we are about to hit the network, so count the request.
+  [ -n "$category" ] && record_request "$category"
 
   local resp code body
   if [ -n "$enc" ]; then
@@ -194,6 +284,8 @@ fetch_json() {
     cat "$cache_file"
     return 0
   fi
+  # Cache miss: we are about to fetch the module JSON, so count the request.
+  record_request json
   local resp code body
   if ! resp=$(curl -sk -w $'\n%{http_code}' "${host}/sites/default/files/modules/${data_name}.json"); then
     printf 'Error: request to %s failed\n' "$host" >&2
@@ -249,7 +341,7 @@ format_value() {
 # Release titles ("- <title>" per line) from the API; empty if none.
 release_titles() {
   local md
-  md=$(serve "/api/module/${1}/releases" "${1}--releases" "$2" 2>/dev/null) || return 0
+  md=$(serve "/api/module/${1}/releases" "${1}--releases" "$2" "" "release" 2>/dev/null) || return 0
   printf '%s\n' "$md" | sed -n 's/^- \*\*\(.*\)\*\*$/- \1/p'
 }
 
@@ -416,6 +508,24 @@ main() {
     exit 0
   fi
 
+  # From here on a real command runs, so account for its output. Redirect stdout
+  # to a temp file; the EXIT trap flushes it back to the terminal and records the
+  # character count. (completion, --help and no-args returned above and are
+  # intentionally not measured.)
+  case "$command" in
+    semantic-search) __out_category="search" ;;
+    release-info)    __out_category="release" ;;
+    module-info | file-structure | documentation-info | readme) __out_category="info" ;;
+    *)               __out_category="" ;;
+  esac
+  ensure_stats
+  __stats_out="$(mktemp 2>/dev/null || printf '')"
+  if [ -n "$__stats_out" ]; then
+    exec 3>&1
+    exec 1>"$__stats_out"
+    trap flush_output EXIT
+  fi
+
   # Parse remaining args: one positional data_name plus flags.
   for arg in "$@"; do
     case "$arg" in
@@ -502,13 +612,15 @@ main() {
       [ -n "$data_name" ] || die "semantic-search requires a quoted <search string>"
       local search_path="/api/module-search"
       [ "$chunk" -eq 1 ] && search_path="${search_path}?chunk=true"
-      # Empty cache key: search results are never cached (they track the index).
-      serve "$search_path" "" "$host" "semantic_search=${data_name}"
+      record_search "$data_name"
+      # Empty cache key: search results are never cached (they track the index),
+      # so serve always hits the network and counts the request.
+      serve "$search_path" "" "$host" "semantic_search=${data_name}" "search"
       ;;
 
     release-info)
       [ -n "$data_name" ] || die "release-info requires a <data_name>"
-      serve "/api/module/${data_name}/releases" "${data_name}--releases" "$host"
+      serve "/api/module/${data_name}/releases" "${data_name}--releases" "$host" "" "release"
       ;;
 
     file-structure)
